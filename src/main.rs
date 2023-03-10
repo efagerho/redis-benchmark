@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering, AtomicBool};
 use std::time::Duration;
 
 use clap::Parser;
+use fred::pool::RedisPool;
 use fred::prelude::*;
 use fred::types::{BackpressureConfig, PerformanceConfig, RedisConfig, ServerConfig};
 use futures::future;
@@ -29,6 +30,9 @@ struct Args {
 
     #[arg(short, long, default_value_t = 1000000)]
     items: u32,
+
+    #[arg(long, default_value_t = true)]
+    pipeline: bool,
 
     // Delete all data in Redis when done?
     #[arg(long, default_value_t = false)]
@@ -120,7 +124,7 @@ async fn insert_items(client: &RedisClient, items: &Vec<Item>) {
 // SET benchmark
 //
 
-async fn benchmark_set(client: RedisClient, args: &Args) {
+async fn benchmark_set(client: RedisPool, args: &Args) {
     let items = gen_items(args.items);
     let chunks: Vec<Vec<Item>> = chunk_vector(items.clone(), args.workers as usize);
 
@@ -152,7 +156,7 @@ async fn benchmark_set(client: RedisClient, args: &Args) {
 // MGET benchmark
 //
 
-async fn benchmark_mget(client: RedisClient, args: &Args) {
+async fn benchmark_mget(client: RedisPool, args: &Args) {
     // Prepare test data
     let items = gen_items(args.items);
     let chunks: Vec<Vec<Item>> =
@@ -225,7 +229,7 @@ async fn benchmark_mget(client: RedisClient, args: &Args) {
     }
 }
 
-async fn benchmark_script(client: RedisClient, args: &Args) {}
+async fn benchmark_script(client: RedisPool, args: &Args) {}
 
 #[tokio::main]
 async fn main() {
@@ -241,7 +245,7 @@ async fn main() {
         database: None,
         tls: None,
         performance: PerformanceConfig {
-            pipeline: true,
+            pipeline: args.pipeline,
             max_command_attempts: 3,
             default_command_timeout_ms: 0,
             cluster_cache_update_delay_ms: 10,
@@ -256,7 +260,7 @@ async fn main() {
     };
 
     let policy = ReconnectPolicy::new_exponential(0, 100, 30_000, 2);
-    let client = RedisClient::new(config);
+    let client = RedisPool::new(config, args.workers as usize).unwrap();
 
     let connection_task = client.connect(Some(policy));
     let _ = client.wait_for_connect().await;
@@ -275,5 +279,7 @@ async fn main() {
         let _ = future::join(benchmark_script(client, &args), interrupt).await;
     }
 
-    connection_task.abort();
+    for task in connection_task {
+        task.abort();
+    }
 }
