@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering, AtomicBool};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use clap::Parser;
@@ -28,10 +28,10 @@ struct Args {
     #[arg(short, long, default_value_t = 10)]
     workers: u32,
 
-    #[arg(short, long, default_value_t = 1000000)]
+    #[arg(short, long, default_value_t = 100000)]
     items: u32,
 
-    #[arg(long, default_value_t = true)]
+    #[arg(long, default_value_t = false)]
     pipeline: bool,
 
     // Delete all data in Redis when done?
@@ -41,7 +41,6 @@ struct Args {
     //
     // Test types
     //
-
     #[arg(long, default_value_t = false)]
     set: bool,
 
@@ -54,7 +53,6 @@ struct Args {
     //
     // MGET test params
     //
-
     #[arg(long, default_value_t = 10)]
     mget_keys: u32,
 }
@@ -159,8 +157,7 @@ async fn benchmark_set(client: RedisPool, args: &Args) {
 async fn benchmark_mget(client: RedisPool, args: &Args) {
     // Prepare test data
     let items = gen_items(args.items);
-    let chunks: Vec<Vec<Item>> =
-        chunk_vector(items.clone(), (args.items / args.workers) as usize);
+    let chunks: Vec<Vec<Item>> = chunk_vector(items.clone(), (args.items / args.workers) as usize);
 
     println!("Inserting test data");
 
@@ -229,7 +226,74 @@ async fn benchmark_mget(client: RedisPool, args: &Args) {
     }
 }
 
-async fn benchmark_script(client: RedisPool, args: &Args) {}
+static LOGOUT_SCRIPT: &str = "if redis.call('get', KEYS[1]) == ARGV[1] then
+  redis.call('del', KEYS[1]);
+  return 1
+else
+  return 0
+end";
+
+async fn benchmark_script(client: RedisPool, args: &Args) {
+    // Prepare test data
+    let items = gen_items(args.items);
+    let chunks: Vec<Vec<Item>> = chunk_vector(items.clone(), (args.items / args.workers) as usize);
+
+    println!("Inserting test data");
+
+    let inserters: Vec<JoinHandle<()>> = chunks
+        .clone()
+        .into_iter()
+        .map(|chunk| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                insert_items(&client, &chunk).await;
+            })
+        })
+        .collect();
+    future::join_all(inserters).await;
+
+    println!("Starting SCRIPT tests");
+    let hash = client.script_load(LOGOUT_SCRIPT).await.unwrap();
+
+    let mut handlers: Vec<JoinHandle<()>> = chunks
+        .into_iter()
+        .map(|chunk| {
+            let client = client.clone();
+            let hash = hash.clone();
+
+            tokio::spawn(async move {
+                let chunk = chunk.clone();
+                while !DONE.load(Ordering::SeqCst) {
+                    // First insert all data.
+                    insert_items(&client, &chunk).await;
+                    // Next remove all data by script.
+                    for item in &chunk {
+                        let res: Result<(), RedisError> =
+                            client.evalsha(&hash, &item.key, &item.value).await;
+                        match res {
+                            Ok(_) => {
+                                REQUEST_COUNT.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Err(e) => {
+                                println!("{:?}", e);
+                                ERROR_COUNT.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+
+    handlers.push(tokio::spawn(print_stats()));
+    future::join_all(handlers).await;
+
+    if args.flushall {
+        println!("Cleaning up test data from Redis...");
+        let res: AsyncResult<()> = client.flushall(false);
+        let _ = res.await;
+    }
+}
 
 #[tokio::main]
 async fn main() {
